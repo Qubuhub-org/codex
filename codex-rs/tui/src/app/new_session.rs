@@ -4,12 +4,66 @@
 
 use super::*;
 use codex_config::ConfigLayerSource;
+use codex_protocol::config_types::ServiceTier;
+
+pub(crate) fn has_launch_setting(
+    config: &Config,
+    cli_kv_overrides: &[(String, TomlValue)],
+    key: &str,
+) -> bool {
+    // A remote server cannot resolve this invocation's explicitly selected local profile.
+    // Only count the profile when it supplies the effective value; project settings can shadow it.
+    cli_kv_overrides.iter().any(|(path, _)| path == key)
+        || config
+            .config_layer_stack
+            .layers_high_to_low()
+            .find(|layer| layer.config.get(key).is_some())
+            .is_some_and(|layer| {
+                matches!(
+                    layer.name,
+                    ConfigLayerSource::User {
+                        profile: Some(_),
+                        ..
+                    }
+                )
+            })
+}
+
+pub(super) fn overlay_new_session_defaults(
+    config: &mut Config,
+    defaults: &codex_app_server_protocol::Config,
+    cli_kv_overrides: &[(String, TomlValue)],
+    harness_overrides: &ConfigOverrides,
+) {
+    if harness_overrides.model.is_none() && !has_launch_setting(config, cli_kv_overrides, "model") {
+        config.model = defaults.model.clone();
+    }
+    if !has_launch_setting(config, cli_kv_overrides, "model_reasoning_effort") {
+        config.model_reasoning_effort = defaults.model_reasoning_effort.clone();
+    }
+    if harness_overrides.service_tier.is_none()
+        && !has_launch_setting(config, cli_kv_overrides, "service_tier")
+    {
+        config.service_tier = defaults.service_tier.as_deref().map(|service_tier| {
+            ServiceTier::from_request_value(service_tier)
+                .map(|tier| tier.request_value().to_string())
+                .unwrap_or_else(|| service_tier.to_string())
+        });
+    }
+    if !has_launch_setting(config, cli_kv_overrides, "daybreak") {
+        config.daybreak_enabled = defaults
+            .additional
+            .get("daybreak")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+    }
+}
 
 impl App {
     pub(super) async fn load_new_session_config(
         &mut self,
         app_server: &AppServerSession,
-    ) -> Result<Config> {
+    ) -> Result<(Config, crate::local_settings::LocalSettings)> {
         let cwd = self.chat_widget.config_ref().cwd.to_path_buf();
         let defaults_cwd = match app_server.thread_params_mode() {
             crate::app_server_session::ThreadParamsMode::Embedded => cwd.as_path(),
@@ -17,64 +71,40 @@ impl App {
                 app_server.remote_cwd_override().unwrap_or(Path::new("."))
             }
         };
-        // config/read resolves relative paths on the server. With no remote launch override,
-        // "." uses the same server process directory as thread/start's omitted cwd.
-        let defaults = match crate::config_update::read_effective_config(
+        let defaults = crate::config_update::read_effective_config_if_supported(
             app_server.request_handle(),
-            defaults_cwd.display().to_string(),
+            defaults_cwd,
         )
-        .await
-        {
-            Ok(response) => Some(response.config),
-            Err(err)
-                if matches!(
-                    err.downcast_ref::<TypedRequestError>(),
-                    Some(TypedRequestError::Server { source, .. })
-                        if source.code == -32601
-                            || source.code == -32600
-                                && source.message.contains("config/read")
-                                && (source.message.contains("unknown variant")
-                                    || source.message.contains("unknown method"))
-                ) =>
-            {
-                // Older servers can still start threads using the existing local defaults.
-                None
-            }
-            Err(err) => return Err(err),
-        };
+        .await?;
         // Stage local preferences and permission carryover without changing the active task.
-        let mut config = match self.rebuild_config_for_cwd(cwd).await {
-            Ok(config) => config,
+        let (mut config, local_settings) = match self.rebuild_config_for_cwd(cwd).await {
+            Ok(config) => {
+                let settings = self.local_settings.reloaded(&config);
+                (config, settings)
+            }
             Err(err) => {
                 tracing::warn!(%err, "failed to refresh local settings before a new thread");
-                self.config.clone()
+                (self.config.clone(), self.local_settings.clone())
             }
         };
-        self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::All);
-        config.service_tier = self.chat_widget.configured_service_tier();
-        if let Some(defaults) = defaults {
-            // A remote server cannot resolve this invocation's explicitly selected local profile.
-            let has_launch_setting = |key: &str| {
-                self.cli_kv_overrides.iter().any(|(path, _)| path == key)
-                    || config.config_layer_stack.layers_high_to_low().any(|layer| {
-                        layer.disabled_reason.is_none()
-                            && matches!(
-                                layer.name,
-                                ConfigLayerSource::User {
-                                    profile: Some(_),
-                                    ..
-                                }
-                            )
-                            && layer.config.get(key).is_some()
-                    })
-            };
-            if self.harness_overrides.model.is_none() && !has_launch_setting("model") {
-                config.model = defaults.model;
-            }
-            if !has_launch_setting("model_reasoning_effort") {
-                config.model_reasoning_effort = defaults.model_reasoning_effort;
-            }
+        if let Some(defaults) = defaults.as_ref() {
+            crate::projectless::apply_defaults(
+                &mut config,
+                &self.harness_overrides,
+                app_server,
+                &self.environment_manager,
+                defaults,
+            );
         }
-        Ok(config)
+        self.apply_runtime_policy_overrides(&mut config, RuntimePolicyOverrideScope::ExplicitOnly)?;
+        if let Some(defaults) = defaults.as_ref() {
+            overlay_new_session_defaults(
+                &mut config,
+                &defaults.config,
+                &self.cli_kv_overrides,
+                &self.harness_overrides,
+            );
+        }
+        Ok((config, local_settings))
     }
 }

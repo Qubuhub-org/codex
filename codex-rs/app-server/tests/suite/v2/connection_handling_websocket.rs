@@ -507,12 +507,8 @@ pub(super) async fn spawn_websocket_server_with_args(
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .env("CODEX_HOME", codex_home)
-        .env("RUST_LOG", "warn");
-    #[cfg(windows)]
-    cmd.env(
-        codex_app_server_transport::DAEMON_SHUTDOWN_FILE_ENV,
-        codex_home.join("daemon.shutdown"),
-    );
+        .env("RUST_LOG", "warn")
+        .env("OTEL_METRIC_EXPORT_INTERVAL", "200");
 
     let mut process = cmd
         .kill_on_drop(true)
